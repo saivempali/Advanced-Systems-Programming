@@ -1,0 +1,25 @@
+#include<iostream>
+#include<stdlib.h>
+#include<pthread.h>
+#include "sem.h"
+
+using namespace std;
+
+int main(int argc, char **argv)
+{
+	cout<<"hi ";
+	char * sem_name = argv[1];
+	cout<<sem_name<<endl;
+	//================================barrier start===================================
+
+	cout<<"philosopher barrier section\n";
+
+	//================================barrier end=====================================
+
+	//================================Philosopher start===============================
+
+	
+
+	//================================Philosopher end=================================
+	return 0;
+}
