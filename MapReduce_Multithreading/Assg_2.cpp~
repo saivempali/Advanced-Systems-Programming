@@ -1,0 +1,1212 @@
+#include<iostream>
+#include<stdlib.h>
+#include<string>
+#include<pthread.h>
+#include<fstream>
+#include<unistd.h>
+#include<map>
+#include<vector>
+
+#define pool_size 5
+
+using namespace std;
+
+// Locks:
+pthread_mutex_t mapper;
+pthread_mutex_t reducer;
+pthread_mutex_t summarizer;
+pthread_mutex_t letter_count_writer;
+pthread_mutex_t summarizer_reducer;
+
+// Condition variables:
+pthread_cond_t mapper_to_updater;
+pthread_cond_t mapper_to_reducer;
+pthread_cond_t reducer_to_writer;
+pthread_cond_t reducer_to_summarizer;
+pthread_cond_t summarizer_to_letterCountWriter;
+
+pthread_cond_t mapperPoolFull;
+pthread_cond_t mapperPoolEmpty;
+
+pthread_cond_t reducerPoolFull;
+pthread_cond_t reducerPoolEmpty;
+
+pthread_cond_t summarizerPoolFull;
+pthread_cond_t summarizerPoolEmpty;
+
+pthread_cond_t letterCountTableFull;
+pthread_cond_t letterCountTableEmpty;
+
+// Data type:
+struct word_list
+{
+	string word;
+	struct word_list* next;
+};
+
+// Mapper Pool data structure:
+struct mapper_pool
+{
+	struct word_list *mapper_pool_entries[pool_size];
+}mp;
+
+// Reducer Pool data structure:
+struct reducer_pool
+{
+	struct word_list *reducer_pool_entries[pool_size];
+}rp;
+
+// Summarizer Pool data structure:
+struct summarizer_pool
+{
+	struct word_list *summarizer_pool_entries[pool_size];
+
+	map<string,int> summarizer_map;	
+}sp;
+
+// Letter count table:
+
+char letter_count_table[pool_size];
+map<char,int> letter_count_map;
+
+int diff_letter_words = 0;
+int mapper_cond = -1;
+int reducer_cond = 0;
+int summarizer_cond = 0;
+int writer_cond = 0;
+int mapperPoolUpdater_done = 0;
+int mapper_done = 0;
+int reducer_done = 0;
+int summarizer_done = 0;
+
+int mapperPool_in = -1;
+int mapperPool_out = -1;
+int mapper_num = 0;
+
+int reducerPool_in = -1;
+int reducerPool_out = -1;
+int reducer_num = 0;
+
+int summarizerPool_in = -1;
+int summarizerPool_out = -1;
+int summarizer_num = 0;
+
+
+int wordCount_in = -1;
+int wordCount_out = -1;
+int wordCount_num = 0;
+
+int letterCount_in = -1;
+int letterCount_out = -1;
+int letterCount_num = 0;
+
+int sumNum_in = -1;
+int sumNum_out = -1;
+int sum_num = 0;
+/*-----------------------------------------------------------------------------------------*/
+/*-------------------------PART 1 - MAPPER-------------------------------------------------*/
+/*-----------------------------------------------------------------------------------------*/
+
+
+/*-----------------Start of Mapper Pool Updater Thread---------------------------*/
+
+void* mapperPoolUpdater_thread(void* arg)
+{
+	cout<<"mapper pool updater started\n";
+
+	string input_file = *(string*)arg;
+	const char* input = input_file.c_str();
+
+	ifstream read_file;
+	read_file.open(input);	
+
+	string line;
+	char start_ch = ' ';
+	
+	if(read_file.is_open())
+	{
+
+		// Loop to find out number of different letters
+		// with which the words int the file start with.
+		while(getline(read_file,line))
+		{
+			//sleep(1);
+			if(start_ch != line[0])
+			{
+				diff_letter_words++;
+				start_ch = line[0];
+			}
+		}
+
+		read_file.close();
+		
+		// Reading from the file and writing to mapper pool.
+		start_ch = ' ';
+		//mp.mapper_pool_entries = new word_list*[diff_letter_words];
+		//rp.reducer_pool_entries = new word_list*[diff_letter_words];
+		int mp_ptr = 0;
+		read_file.open(input);
+		struct word_list* last;
+		while(getline(read_file,line))
+		{
+
+
+			cout<<"Mapper pool updater is reading "<<line[0]<<endl;
+
+//-----------------------------------Mapper Pool Producer check------------------------------------------------
+			while(mapper_num == pool_size)
+			{
+				cout<<"mapper pool is full\n";
+				pthread_cond_signal(&mapper_to_updater);
+				pthread_cond_wait(&mapperPoolFull, &mapper);
+			}
+
+			if(start_ch != line[0])
+			{
+				pthread_mutex_lock(&mapper);
+				mapperPool_in = (mapperPool_in + 1) % pool_size;
+				cout<<"mapper pool in = "<<mapperPool_in<<endl;
+				start_ch = line[0];
+				struct word_list* head = new word_list;
+				head->word = line;
+				head->next = NULL;
+				last = head;
+				mp.mapper_pool_entries[mapperPool_in] = head;
+				mp_ptr++;
+				mapper_num++;
+				if(mapper_cond != -1)
+				{
+					//sleep(3);
+					cout<<"Mapper pool is signalling\n";
+					pthread_cond_signal(&mapper_to_updater);
+					sleep(30);
+				}
+				mapper_cond++;
+				pthread_mutex_unlock(&mapper);
+			}
+
+			else
+			{
+				last->next = new word_list;
+				last->next->word = line;
+				last->next->next = NULL;
+				last = last->next;
+			}
+
+//---------------------------------------Mapper Pool Producer Check------------------------------------
+			if(mapper_num == 1)
+			{
+				pthread_cond_signal(&mapperPoolEmpty);
+			}
+			
+			//sleep(1);
+		}
+		
+		mapperPoolUpdater_done = 1;
+
+		pthread_cond_broadcast(&mapper_to_updater);
+		//sleep(1);
+	
+		read_file.close();
+	}
+
+	else
+	{
+		cout<<"Error in opening the file\n" ;
+	}
+
+	cout<<"Mapper pool updater exiting\n";
+	pthread_exit(0);
+}
+
+
+/*-----------------End of Mapper Pool Updater Thread---------------------------*/
+
+/*-------------------------Start of Mapper Thread------------------------------*/
+
+int mapper_ptr = 0;
+void* mapper_thread(void* arg)
+{
+	pthread_mutex_lock(&mapper);
+	int tid = *(int*)arg;
+	cout<<"Mapper thread "<<tid+1<<" started\n";
+
+	/*if(mapper_cond == 0 || mapper_cond == -1)
+	{
+		pthread_cond_wait(&mapper_to_updater, &mapper);
+		cout<<"Mapper thread "<<tid+1<<" is writing\n";
+	}*/
+	pthread_cond_wait(&mapper_to_updater, &mapper);
+	struct word_list* mapper_head;
+	int flag = 0;
+
+	while(1)
+	{
+		
+		if(mapperPoolUpdater_done == 1 || mapperPoolUpdater_done == 2)
+		{
+			break;
+		}
+//--------------------------------------Mapper Consumer Check------------------------------------
+		while(mapper_num == 0)
+		{
+			cout<<"Mapper entered 1st conditional wait\n";
+
+			pthread_cond_wait(&mapperPoolEmpty, &mapper);
+		}
+
+//--------------------------------------Mapper Producer Check--------------------------------------
+		while(reducer_num == pool_size)
+		{
+			pthread_cond_signal(&mapper_to_reducer);
+			
+			pthread_cond_wait(&reducerPoolFull, &mapper);
+		}
+
+		cout<<"Mapper thread "<<tid+1<<" is writing\n";
+		mapperPool_out = (mapperPool_out+1) % pool_size;
+		cout<<"mapper pool out = "<<mapperPool_out<<endl;
+		mapper_num--;
+		mapper_head = mp.mapper_pool_entries[mapperPool_out];
+		struct word_list* head = NULL;
+		struct word_list* last = head;
+		while(mapper_head != NULL)
+		{
+			if(head == NULL)
+			{
+				head = new word_list;
+				head->word = "(" + mapper_head->word + ",1)";
+				head->next = NULL;
+				last = head;
+				cout<<last->word<<endl;
+			}
+
+			else
+			{
+				last->next = new word_list;
+				last->next->word = "(" + mapper_head->word + ",1)";
+				last->next->next = NULL;
+				last = last->next;
+				cout<<last->word<<endl;
+			}
+
+			mapper_head = mapper_head->next;
+		}
+
+		pthread_mutex_lock(&reducer);
+		reducerPool_in = (reducerPool_in+1) % pool_size;
+		rp.reducer_pool_entries[reducerPool_in] = head;
+		cout<<"mapper finished writing "<<head->word[1]<<" to the reducer pool\n";
+		reducer_num++;
+		pthread_mutex_unlock(&reducer);
+		mapper_cond--;
+		mapper_ptr++;
+		reducer_cond++;
+		
+//--------------------------------------Mapper Producer Check------------------------------------
+		if(reducer_num == 1)
+		{
+			pthread_cond_signal(&reducerPoolEmpty);
+		}
+
+		if(reducer_cond > 0)
+		{
+			pthread_cond_signal(&mapper_to_reducer);
+			sleep(1);
+		}
+//--------------------------------------Mapper Consumer Check------------------------------------
+
+		if(mapper_num == pool_size-1)
+		{
+			pthread_cond_broadcast(&mapperPoolFull);
+		}
+
+		//pthread_mutex_unlock(&mapper);
+		//sleep(1);
+		if(mapperPoolUpdater_done == 0)
+		{
+			cout<<"Mapper "<<tid+1<<" eis now releasing the lock\n";
+			pthread_cond_wait(&mapper_to_updater, &mapper);
+		}
+	}
+
+	if(mapperPoolUpdater_done == 1)	
+	{
+
+//--------------------------------------Mapper Consumer Check------------------------------------
+		while(mapper_num == 0)
+		{
+			cout<<"Mapper entered 1st conditional wait\n";
+			pthread_cond_wait(&mapperPoolEmpty, &mapper);
+		}
+
+//--------------------------------------Mapper Producer Check--------------------------------------
+		while(reducer_num == pool_size)
+		{
+			cout<<"entered Mapper Producer Check while\n";
+			pthread_cond_signal(&mapper_to_reducer);
+			pthread_cond_wait(&reducerPoolFull, &mapper);
+		}
+
+
+//------------------------------------------------Working-----------------------------------------------
+		cout<<"Mapper thread "<<tid+1<<" is doing the final write\n";
+		cout<<"mapper pool out = "<<mapperPool_out<<endl;
+		while(mapperPool_in != mapperPool_out)
+		{
+			mapperPool_out = (mapperPool_out+1) % pool_size;
+			cout<<"mapper pool out = "<<mapperPool_out<<endl;
+			mapper_head = mp.mapper_pool_entries[mapperPool_out];
+			struct word_list* head = NULL;
+			struct word_list* last = head;
+			while(mapper_head != NULL)
+			{
+				if(head == NULL)
+				{
+					head = new word_list;
+					head->word = "(" + mapper_head->word + ",1)";
+					head->next = NULL;
+					last = head;
+					cout<<last->word<<endl;
+				}
+
+				else
+				{
+					last->next = new word_list;
+					last->next->word = "(" + mapper_head->word + ",1)";
+					last->next->next = NULL;
+					last = last->next;
+					cout<<last->word<<endl;
+				}
+
+				mapper_head = mapper_head->next;
+			}
+
+			pthread_mutex_lock(&reducer);
+			
+			reducerPool_in = (reducerPool_in + 1) % pool_size;
+			rp.reducer_pool_entries[reducerPool_out] = head;
+			cout<<"mapper finished writing "<<head->word[1]<<" to the reducer pool\n";
+			reducer_num++;
+			mapper_ptr++;
+			pthread_mutex_unlock(&reducer);
+
+//--------------------------------------Mapper Producer Check------------------------------------
+			if(reducer_num == 1)
+			{
+				cout<<"entered Mapper Producer Check if\n";
+				pthread_cond_signal(&reducerPoolEmpty);
+			}
+//--------------------------------------Mapper Consumer Check------------------------------------
+
+			if(mapper_num == pool_size-1)
+			{
+
+				cout<<"entered Mapper consumer Check if\n";
+				pthread_cond_broadcast(&mapperPoolFull);
+			}
+			
+		}
+
+		/*pthread_mutex_lock(&reducer);
+		rp.reducer_pool_entries[mapper_ptr] = head;
+		pthread_mutex_unlock(&reducer);*/
+		mapperPoolUpdater_done = 2;
+		mapper_done = 1;
+		sleep(1);
+		pthread_cond_broadcast(&mapper_to_updater);
+		sleep(1);
+		pthread_cond_signal(&mapper_to_reducer);
+	}
+	
+	cout<<"Mapper thread "<<tid+1<<" is exiting\n";
+	pthread_mutex_unlock(&mapper);
+	pthread_exit(0);
+}
+
+/*-------------------------End of Mapper Thread--------------------------------*/
+
+/*-----------------------------------------------------------------------------------------*/
+/*-------------------------PART 2 - REDUCER------------------------------------------------*/
+/*-----------------------------------------------------------------------------------------*/
+
+/*-------------------------Start of Reducer Thread------------------------------*/
+
+int reducer_ptr = 0;
+int writerFlag = 0;
+
+map<string,int>::iterator it;
+vector<string> mapVector;
+int tempMapPtr = 0;
+
+void* reducer_thread(void* arg)
+{
+	pthread_mutex_lock(&reducer);
+	int tid = *(int *)arg;
+	cout<<"Reducer thread "<<tid+1<<" started\n";
+	pthread_cond_wait(&mapper_to_reducer, &reducer);
+
+	sleep(2);
+
+	while(1)
+	{
+		cout<<"Reducer thread "<<tid+1<<" is writing\n";
+
+//--------------------------------------------Reduecr Producer check-----------------------------------
+
+		while(summarizer_num == pool_size)
+		{
+			cout<<"entered reducer Producer Check while\n";
+			pthread_cond_signal(&reducer_to_writer);
+			pthread_cond_wait(&summarizerPoolFull, &reducer);
+		}
+
+
+
+//-------------------------------------------Reducer Consumer check--------------------------------------
+
+		while(reducer_num == 0)
+		{
+			cout<<"entered reducer consumer Check while\n";
+			pthread_cond_signal(&mapper_to_reducer);
+			pthread_cond_wait(&reducerPoolEmpty, &reducer);
+		}
+
+		reducerPool_out = (reducerPool_out + 1) % pool_size;	
+		struct word_list* runner = rp.reducer_pool_entries[reducerPool_out];
+		while(runner != NULL)
+		{
+
+			char str[runner->word.length()-4+1];
+			int i=1;
+			while(runner->word[i] != ',')
+			{
+				str[i-1] = runner->word[i];
+				i++;
+			}
+			str[i-1] = '\0';
+
+			if(sp.summarizer_map.find(str) == sp.summarizer_map.end())
+			{
+				pthread_mutex_lock(&summarizer);
+				sp.summarizer_map.insert(sp.summarizer_map.end(), pair<string,int>(str,1));
+				pthread_mutex_unlock(&summarizer);
+				mapVector.push_back(str);
+			}
+		
+			else
+			{
+				pthread_mutex_lock(&summarizer);
+				sp.summarizer_map.find(str)->second++;
+				pthread_mutex_unlock(&summarizer);
+			}
+			runner = runner->next;
+		}
+
+		summarizerPool_in = (summarizerPool_in + 1) % pool_size;
+		sumNum_in = (sumNum_in + 1) % pool_size;
+		struct word_list* head = NULL;
+		struct word_list* last = new word_list;
+		head = NULL;
+
+		while(tempMapPtr < mapVector.size())
+		{
+			map<string, int>::iterator it = sp.summarizer_map.find(mapVector[tempMapPtr]);
+			if(head == NULL)
+			{
+				head = new word_list;
+				head->word = "(" + it->first + "," + to_string(it->second) + ")";
+				head->next = NULL;
+				last = head;
+				cout<<last->word<<endl;
+			}
+
+			else
+			{
+				last->next = new word_list;
+				last->next->word = "(" + it->first + "," + to_string(it->second) + ")";
+				last->next->next = NULL;
+				last = last->next;
+				cout<<last->word<<endl;
+			}
+			tempMapPtr++;	
+		}
+
+		sp.summarizer_pool_entries[summarizerPool_in] = head;
+		cout<<"reducer finished writing "<<head->word[1]<<" to the summarizer pool\n";
+		reducer_num--;
+		summarizer_num++;
+		sum_num++;
+		reducer_cond--;
+		reducer_ptr++;
+
+//-------------------------------------Reducer Producer Check---------------------------------------------
+		if(summarizer_num == 1 || sum_num == 1)
+		{
+			cout<<"entered reducer Producer Check if\n";
+			pthread_cond_signal(&summarizerPoolEmpty);
+		}
+
+//-------------------------------------Reducer Consumer Check---------------------------------------------
+		if(reducer_num == pool_size-1)
+		{
+			cout<<"entered reducer consumer Check if\n";
+			pthread_cond_signal(&reducerPoolFull);
+		}
+
+
+
+		if(mapper_done == 0)
+		{
+			writer_cond++;
+			summarizer_cond++;
+			pthread_cond_signal(&reducer_to_writer);
+			//sleep(2);
+			pthread_cond_signal(&reducer_to_summarizer);
+			//sleep(2);
+			pthread_cond_wait(&mapper_to_reducer, &reducer);
+			sleep(2);
+		}
+
+		if(mapper_done == 1)
+		{
+			cout<<"Reducer thread "<<tid+1<<" is doing the final  write\n";
+
+//--------------------------------------------Reduecr Producer check-----------------------------------
+
+			while(summarizer_num == pool_size)
+			{
+				pthread_cond_signal(&reducer_to_writer);
+				pthread_cond_wait(&summarizerPoolFull, &reducer);
+			}
+
+
+
+//-------------------------------------------Reducer Consumer check--------------------------------------
+
+			while(reducer_num == 0)
+			{
+				pthread_cond_signal(&mapper_to_reducer);
+				pthread_cond_wait(&reducerPoolEmpty, &reducer);
+			}
+
+//---------------------------------------------Working------------------------------------------------------
+			cout<<"reducer pool out = "<<reducerPool_out<<endl;
+			while(reducerPool_in != reducerPool_out)
+			{
+				cout<<"reducer inside final while loop\n";
+				struct word_list* runner = rp.reducer_pool_entries[reducerPool_out];
+		
+				while(runner != NULL)
+				{
+
+					char str[runner->word.length()-4+1];
+					int i=1;
+					while(runner->word[i] != ',')
+					{
+						str[i-1] = runner->word[i];
+						i++;
+					}
+					str[i-1] = '\0';
+
+					if(sp.summarizer_map.find(str) == sp.summarizer_map.end())
+					{
+						pthread_mutex_lock(&summarizer);
+						sp.summarizer_map.insert(sp.summarizer_map.end(), pair<string,int>(str,1));
+						pthread_mutex_unlock(&summarizer);
+						mapVector.push_back(str);
+					}
+		
+					else
+					{
+						pthread_mutex_lock(&summarizer);
+						sp.summarizer_map.find(str)->second++;
+						pthread_mutex_unlock(&summarizer);
+					}
+					runner = runner->next;
+				}
+				reducerPool_out = (reducerPool_out + 1) % pool_size;	
+			}
+
+			summarizerPool_in = (summarizerPool_in + 1) % pool_size;
+			sumNum_in = (sumNum_in + 1) % pool_size;
+			struct word_list* head = NULL;
+			struct word_list* last = new word_list;
+			head = NULL;
+
+			while(tempMapPtr < mapVector.size())
+			{
+				map<string, int>::iterator it = sp.summarizer_map.find(mapVector[tempMapPtr]);
+				if(head == NULL)
+				{
+					head = new word_list;
+					head->word = "(" + it->first + "," + to_string(it->second) + ")";
+					head->next = NULL;
+					last = head;
+					cout<<"  "<<last->word<<endl;
+				}
+
+				else
+				{
+					last->next = new word_list;
+					last->next->word = "(" + it->first + "," + to_string(it->second) + ")";
+					last->next->next = NULL;
+					last = last->next;
+					cout<<"   "<<last->word<<endl;
+				}
+				tempMapPtr++;	
+			}
+
+			sp.summarizer_pool_entries[summarizerPool_in] = head;
+			cout<<"reducer finished writing "<<head->word[1]<<" to the summarizer pool\n";
+			reducer_num--;
+			summarizer_num++;
+			sum_num++;
+
+//-------------------------------------Reducer Producer Check---------------------------------------------
+			if(summarizer_num == 1)
+			{
+				pthread_cond_signal(&summarizerPoolEmpty);
+			}
+
+//-------------------------------------Reducer Consumer Check---------------------------------------------
+			if(reducer_num == pool_size-1)
+			{
+				pthread_cond_signal(&reducerPoolFull);
+			}
+			
+			writer_cond++;
+			summarizer_cond++;
+			mapper_done = 2;
+			reducer_done = 1;
+			pthread_cond_broadcast(&reducer_to_writer);
+			sleep(1);
+			pthread_cond_broadcast(&reducer_to_summarizer);
+			sleep(1);
+			pthread_cond_broadcast(&mapper_to_reducer);
+		}
+
+		if(mapper_done == 2)
+		{
+			break;
+		}	
+	}
+
+	cout<<"Reducer thread "<<tid+1<<" is exiting\n";
+	pthread_mutex_unlock(&reducer);
+	pthread_exit(0);
+}
+
+/*-------------------------End of Reducer Thread-------------------------------*/
+
+/*-----------------------------------------------------------------------------------------*/
+/*-------------------------PART 3 - SUMMARIZER---------------------------------------------*/
+/*-----------------------------------------------------------------------------------------*/
+
+/*-------------------------Start of Summarizer Thread--------------------------*/
+
+int summarizer_ptr = 0;
+char prev_start_ch = '\0';
+vector<char> letterCountVector;
+
+void* summarizer_thread(void* arg)
+{
+	pthread_mutex_lock(&summarizer);
+	int tid = *(int*)arg;
+	cout<<"Summarizer thread "<<tid+1<<" started\n";
+	pthread_cond_wait(&reducer_to_summarizer, &summarizer);
+	
+	
+	while(1)
+	{
+		//sleep(2);
+
+		cout<<"Summarizer thread "<<tid+1<<" is writing\n";
+
+//-------------------------------------------Summarizer Producer check---------------------------------------
+		while(letterCount_num == pool_size)
+		{
+			cout<<"summarizer producer while\n";
+			pthread_cond_wait(&letterCountTableFull, &summarizer);
+			cout<<"after summarizer producer while\n";
+		}	
+
+//-------------------------------------------Summarizer Consumer check----------------------------------------
+		while(sum_num == 0)
+		{
+			cout<<"summarizer consumer while\n";
+			pthread_cond_wait(&summarizerPoolEmpty, &summarizer);
+			cout<<"after summarizer consumer while\n";
+		}
+
+		if(summarizer_cond > 0)	
+		{
+			while(summarizer_ptr < mapVector.size())
+			{
+
+				it = sp.summarizer_map.find(mapVector[summarizer_ptr]);
+				if(prev_start_ch != it->first[0])
+				{
+					prev_start_ch = it->first[0];
+					letter_count_map.insert(letter_count_map.end(),pair<char,int>(prev_start_ch, it->second));
+					letterCountVector.push_back(prev_start_ch);
+					
+					pthread_mutex_lock(&letter_count_writer);
+					letterCount_in = (letterCount_in + 1) % pool_size;
+					letter_count_table[letterCount_in] = prev_start_ch;
+					letterCount_num++;
+					pthread_mutex_unlock(&letter_count_writer);
+					summarizer_ptr++;
+				}
+
+				else
+				{
+					letter_count_map.find(prev_start_ch)->second += it->second;
+					summarizer_ptr++;
+				}
+			}
+
+//---------------------------------------------------------------------------------------------------------------
+			/*sumNum_out = (sumNum_out + 1) % pool_size;
+			
+			struct word_list* runner = sp.summarizer_pool_entries[sumNum_out];
+		
+			while(runner != NULL)
+			{
+				cout<<"entered while\n";
+				char str[runner->word.length()-4+1];
+				int i=1;
+				while(runner->word[i] != ',')
+				{
+					str[i-1] = runner->word[i];
+					i++;
+				}
+				str[i-1] = '\0';
+
+				it = sp.summarizer_map.find(str);
+				if(prev_start_ch != it->first[0])
+				{
+					prev_start_ch = it->first[0];
+					letter_count_map.insert(letter_count_map.end(),pair<char,int>(prev_start_ch, it->second));
+					letterCountVector.push_back(prev_start_ch);
+					
+					pthread_mutex_lock(&letter_count_writer);
+					letterCount_in = (letterCount_in + 1) % pool_size;
+					letter_count_table[letterCount_in] = prev_start_ch;
+					cout<<"summarizer wrote "<<prev_start_ch<<" to letter count table\n";
+					letterCount_num++;
+					pthread_mutex_unlock(&letter_count_writer);
+					summarizer_ptr++;
+				}
+
+				else
+				{
+					letter_count_map.find(prev_start_ch)->second += it->second;
+					summarizer_ptr++;
+				}
+				runner = runner->next;
+			}
+			summarizer_cond--;
+			sum_num--;*/
+		}
+
+//-------------------------------------------------------Summarizer Producer check----------------------------------
+		if(letterCount_num == 1)
+		{
+			pthread_cond_signal(&letterCountTableEmpty);
+		}
+
+//-------------------------------------------------------Summarizer consumer check----------------------------------
+		if(sum_num == pool_size-1)
+		{
+			pthread_cond_signal(&summarizerPoolFull);
+		}
+
+		if(reducer_done == 1)
+		{	
+			break;				
+		}
+
+		else
+		{
+			pthread_cond_signal(&summarizer_to_letterCountWriter);
+			
+			pthread_cond_wait(&reducer_to_summarizer, &summarizer);
+
+			sleep(2);
+		}
+	}
+
+	while(summarizer_ptr < mapVector.size())
+	{
+		it = sp.summarizer_map.find(mapVector[summarizer_ptr]);
+		cout<<"Summarizer thread "<<tid+1<<" is doing the final  write\n";
+		if(prev_start_ch != it->first[0])
+		{
+			prev_start_ch = it->first[0];
+			letter_count_map.insert(letter_count_map.end(),pair<char,int>(prev_start_ch, it->second));
+			letterCountVector.push_back(prev_start_ch);
+			pthread_mutex_lock(&letter_count_writer);
+			letterCount_in = (letterCount_in + 1) % pool_size;
+			letter_count_table[letterCount_in] = prev_start_ch;
+			letterCount_num++;
+			pthread_mutex_unlock(&letter_count_writer);
+			summarizer_ptr++;
+		}
+		else
+		{
+			letter_count_map.find(prev_start_ch)->second += it->second;
+			summarizer_ptr++;
+		}
+	}
+	
+	/*sumNum_out = (sumNum_out + 1) % pool_size;
+			
+	struct word_list* runner = sp.summarizer_pool_entries[sumNum_out];
+	while(runner != NULL)
+	{
+		char str[runner->word.length()-4+1];
+		int i=1;
+		while(runner->word[i] != ',')
+		{
+			str[i-1] = runner->word[i];
+			i++;
+		}
+		str[i-1] = '\0';
+
+		it = sp.summarizer_map.find(str);
+		if(prev_start_ch != it->first[0])
+		{
+			prev_start_ch = it->first[0];
+			letter_count_map.insert(letter_count_map.end(),pair<char,int>(prev_start_ch, it->second));
+			letterCountVector.push_back(prev_start_ch);
+					
+			pthread_mutex_lock(&letter_count_writer);
+			letterCount_in = (letterCount_in + 1) % pool_size;
+			letter_count_table[letterCount_in] = prev_start_ch;
+			cout<<"summarizer wrote "<<prev_start_ch<<" to letter count table\n";
+			letterCount_num++;
+			pthread_mutex_unlock(&letter_count_writer);
+			summarizer_ptr++;
+		}
+
+		else
+		{
+			letter_count_map.find(prev_start_ch)->second += it->second;
+			summarizer_ptr++;
+		}
+		runner = runner->next;
+	}
+	*/
+
+	sum_num--;
+	summarizer_cond--;
+	summarizer_done = 1;
+	pthread_cond_broadcast(&summarizer_to_letterCountWriter);
+	pthread_mutex_unlock(&summarizer);		
+	pthread_exit(0);
+}
+
+/*-------------------------End of Summarizer Thread----------------------------*/
+
+/*------------------Start of Word Count Writer Thread--------------------------*/
+
+int mapVector_ptr = 0;
+
+void* wordCountWriter_thread(void* arg)
+{
+	pthread_mutex_lock(&summarizer);	
+	cout<<"Word Count Writer thread started\n";	
+	pthread_cond_wait(&reducer_to_writer, &summarizer);
+	sleep(2);
+	it = sp.summarizer_map.begin();
+	ofstream output;
+	output.open("wordCount.txt");
+	while(1)
+	{
+		
+
+//-----------------------------Word count consumer check------------------------------------------
+		while(summarizer_num == 0)
+		{
+			pthread_cond_wait(&summarizerPoolEmpty,&summarizer);
+			pthread_mutex_lock(&summarizer);
+		}
+
+		//if(writer_cond > 0)
+		//{
+			summarizerPool_out = (summarizerPool_out + 1) % pool_size;
+			cout<<"summarizer out = "<<summarizerPool_out<<endl;
+			struct word_list* runner = sp.summarizer_pool_entries[summarizerPool_out];
+			/*while(mapVector_ptr < mapVector.size())
+			{
+				it = sp.summarizer_map.find(mapVector[mapVector_ptr]);
+				output<<"("<<it->first<<","<<it->second<<")\n";
+				cout<<"("<<it->first<<","<<it->second<<")\n";
+				mapVector_ptr++;
+			}*/
+
+			while(runner != NULL)
+			{
+				char str[runner->word.length()-4+1];
+				int i=1;
+				while(runner->word[i] != ',')
+				{
+					str[i-1] = runner->word[i];
+					i++;
+				}
+				str[i-1] = '\0';
+				it = sp.summarizer_map.find(str);
+				output<<"("<<it->first<<","<<it->second<<")\n";
+				cout<<"("<<it->first<<","<<it->second<<")\n";
+				cout<<"Word count writer thread is writing "<<it->first[0]<<"\n";	
+				mapVector_ptr++;
+				runner = runner->next;
+			}
+			summarizer_num--;
+			writerFlag = 0;
+			writer_cond--;
+			pthread_cond_wait(&reducer_to_writer, &summarizer);
+			sleep(2);
+		//}
+
+		//else
+	//	{
+	//		cout<<"Nothing yet available to write - word count writer\n";
+	//	}
+
+//-----------------------------Word count consumer check------------------------------------------
+		if(summarizer_num == pool_size-1)
+		{
+			pthread_cond_signal(&summarizerPoolFull);
+		}
+		if(reducer_done == 1)
+		{
+			break;	
+		}
+	}
+
+	/*while(mapVector_ptr < mapVector.size())
+	{
+		it = sp.summarizer_map.find(mapVector[mapVector_ptr]);
+		output<<"("<<it->first<<","<<it->second<<")\n";
+		cout<<"("<<it->first<<","<<it->second<<")\n";
+		mapVector_ptr++;
+	}*/
+
+	summarizerPool_out = (summarizerPool_out + 1) % pool_size;
+	cout<<"summarizer out = "<<summarizerPool_out<<endl;
+	struct word_list* runner = sp.summarizer_pool_entries[summarizerPool_out];
+	while(runner != NULL)
+	{
+		
+		char str[runner->word.length()-4+1];
+		int i=1;
+		while(runner->word[i] != ',')
+		{
+			str[i-1] = runner->word[i];
+			i++;
+		}
+		str[i-1] = '\0';
+		it = sp.summarizer_map.find(str);
+		output<<"("<<it->first<<","<<it->second<<")\n";
+		cout<<"("<<it->first<<","<<it->second<<")\n";
+		mapVector_ptr++;
+		runner = runner->next;
+	}
+	summarizer_num--;
+
+	summarizer_done = 1;
+	output.close();
+	cout<<"Word Count Writer thread finished writing to the output word count file\n";	
+	cout<<"Word Count Writer thread exited\n";
+	pthread_mutex_unlock(&summarizer);	
+	sleep(1);
+	pthread_exit(0);
+}
+
+/*------------------End of Word Count Writer Thread----------------------------*/
+
+/*------------------Start of Letter Count Writer Thread------------------------*/
+
+int letterCountWriter_ptr = 0;
+
+void* letterCountWriter_thread(void* arg)
+{
+	pthread_mutex_lock(&letter_count_writer);
+
+	cout<<"Letter count writer started\n";
+	map<char,int>::iterator it;
+	ofstream output;
+	output.open("letterCount.txt");
+	pthread_cond_wait(&summarizer_to_letterCountWriter, &letter_count_writer);
+	sleep(2);
+
+	while(1)
+	{
+		cout<<"Letter count writer thread is writing\n";
+
+		while(letterCount_num == 0)
+		{
+			pthread_cond_wait(&letterCountTableEmpty, &letter_count_writer);
+		}	
+		/*while(letterCountWriter_ptr < letterCountVector.size())
+		{
+			it = letter_count_map.find(letterCountVector[letterCountWriter_ptr]);
+			output<<"("<<it->first<<","<<it->second<<")\n";	
+			letterCountWriter_ptr++;
+		}*/
+
+		//if()
+		//{
+			letterCount_out = (letterCount_out + 1) % pool_size;
+			cout<<"LCW : "<<letterCount_out<<"  "<<letter_count_table[letterCount_out]<<endl;
+			it = letter_count_map.find(letter_count_table[letterCount_out]);
+			output<<"("<<it->first<<","<<it->second<<")\n";	
+			letterCountWriter_ptr++;
+			letterCount_num++;
+		//}
+		
+		if(letterCount_num == pool_size-1)
+		{
+			pthread_cond_signal(&letterCountTableFull);
+		}
+
+		if(summarizer_done == 0)
+		{
+			pthread_cond_wait(&summarizer_to_letterCountWriter, &summarizer);
+			sleep(2);
+		}
+		else
+		{
+			break;
+		}
+	}
+
+	/*while(letterCountWriter_ptr < letterCountVector.size())
+	{
+		it = letter_count_map.find(letterCountVector[letterCountWriter_ptr]);
+		cout<<endl;
+		output<<"("<<it->first<<","<<it->second<<")\n";
+		letterCountWriter_ptr++;
+	}*/
+
+	/*letterCount_out = (letterCount_out + 1) % pool_size;
+	it = letter_count_map.find(letter_count_table[letterCount_out]);
+	output<<"("<<it->first<<","<<it->second<<")\n";	
+	letterCountWriter_ptr++;*/
+	output.close();
+	cout<<"Letter Count Writer thread finished writing to the output letter count file\n";	
+	cout<<"Letter Count Writer thread exited\n";
+	pthread_mutex_unlock(&letter_count_writer);
+	sleep(1);
+	pthread_exit(0);
+}
+
+/*------------------End of Letter Count Writer Thread--------------------------*/
+
+
+int main(int argc, char **argv)
+{
+	
+	if(argc < 2)
+	{
+		cout<<"Incorrect input entered. Re-enter with correct number of arguments\n";
+		exit(0);
+	}
+
+	string* input_file = new string(argv[1]);
+
+	// Number of mapper & reducer threads:
+	int num_of_mapper_threads = atoi(argv[2]);
+	int num_of_reducer_threads = atoi(argv[3]);
+	int num_of_summarizer_threads = atoi(argv[4]);
+
+	// Initializing locks:
+	pthread_mutex_init(&mapper, NULL);
+	pthread_mutex_init(&reducer, NULL);
+	pthread_mutex_init(&summarizer, NULL);
+	pthread_mutex_init(&letter_count_writer, NULL);
+	pthread_mutex_init(&summarizer_reducer, NULL);
+
+	// Initializing condition variables:
+	pthread_cond_init(&mapper_to_reducer, NULL);
+	pthread_cond_init(&mapper_to_updater, NULL);
+	pthread_cond_init(&reducer_to_writer, NULL);
+	pthread_cond_init(&reducer_to_summarizer, NULL);
+	pthread_cond_init(&summarizer_to_letterCountWriter, NULL);
+	pthread_cond_init(&mapperPoolEmpty, NULL);
+	pthread_cond_init(&mapperPoolFull, NULL);
+	pthread_cond_init(&reducerPoolEmpty, NULL);
+	pthread_cond_init(&reducerPoolFull, NULL);
+	pthread_cond_init(&summarizerPoolFull, NULL);
+	pthread_cond_init(&summarizerPoolEmpty, NULL);
+	pthread_cond_init(&letterCountTableEmpty, NULL);
+	pthread_cond_init(&letterCountTableEmpty, NULL);
+
+
+	// Creating the mapper thread which reads 
+	// from mapper pool and writes to reducer pool:
+	pthread_t mapper_tid[num_of_mapper_threads];
+
+	for(int i = 0; i < num_of_mapper_threads; i++)
+	{
+		pthread_create(&mapper_tid[i], NULL, mapper_thread, &i);
+		sleep(1);
+	}
+
+	sleep(1);
+
+	// Creating the reducer thread which reads 
+	// from reducer pool and writes to summarizer pool:
+	pthread_t reducer_tid[num_of_reducer_threads];
+
+	for(int i = 0; i < num_of_reducer_threads; i++)
+	{
+		pthread_create(&reducer_tid[i], NULL, reducer_thread, &i);
+		sleep(1);
+	}
+
+	sleep(1);
+
+	// Creating the summarizer thread which reads from
+	// summarizer pool and writes to letter count table:
+	pthread_t summarizer_tid[num_of_summarizer_threads];
+
+/*	for(int i = 0; i < num_of_summarizer_threads; i++)
+	{
+		pthread_create(&summarizer_tid[i], NULL, summarizer_thread, &i);
+		sleep(1);
+	}*/
+
+	//sleep(1);
+
+	// Creating the Word Count Writer thread:
+	pthread_t wordCountWriter_tid;
+	pthread_create(&wordCountWriter_tid, NULL, wordCountWriter_thread, NULL);	
+	
+	// Creating the letter Count Writer thread:
+	pthread_t letterCountWriter_tid;
+//	pthread_create(&letterCountWriter_tid, NULL, letterCountWriter_thread, NULL);	
+
+	// Creating the mapper pool updater thread:
+	pthread_t mapperPoolUpdater_tid;
+	pthread_create(&mapperPoolUpdater_tid, NULL, mapperPoolUpdater_thread, (void*)input_file);	
+		
+	pthread_join(mapperPoolUpdater_tid, NULL);
+
+	for(int i = 0; i < num_of_mapper_threads; i++)
+		pthread_join(mapper_tid[i], NULL);
+	
+	for(int i = 0; i < num_of_reducer_threads; i++)
+		pthread_join(reducer_tid[i], NULL);
+	
+/*	for(int i = 0; i < num_of_summarizer_threads; i++)
+		pthread_join(summarizer_tid[i], NULL);*/
+
+	pthread_join(wordCountWriter_tid, NULL);
+
+//	pthread_join(letterCountWriter_tid, NULL);
+
+	return 0;
+}

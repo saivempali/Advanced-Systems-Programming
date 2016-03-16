@@ -1,0 +1,1 @@
+cmd_/home/vishnu/TestPrograms/Assignment4/chardriver.ko := ld -r -m elf_x86_64 -T ./scripts/module-common.lds --build-id  -o /home/vishnu/TestPrograms/Assignment4/chardriver.ko /home/vishnu/TestPrograms/Assignment4/chardriver.o /home/vishnu/TestPrograms/Assignment4/chardriver.mod.o
